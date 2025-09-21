@@ -1,0 +1,55 @@
+[Vector addition of 1048576 elements]
+Device memory before alloc: free=39898 MB, total=40326 MB
+naive blocks=1024 threads=64 avg_ms=0.004 bw=1034.34 GB/s
+naive blocks=2048 threads=64 avg_ms=0.005 bw=864.14 GB/s
+naive blocks=4096 threads=64 avg_ms=0.007 bw=632.10 GB/s
+naive blocks=8192 threads=64 avg_ms=0.010 bw=417.96 GB/s
+naive blocks=1024 threads=128 avg_ms=0.004 bw=1039.59 GB/s
+naive blocks=2048 threads=128 avg_ms=0.005 bw=853.33 GB/s
+naive blocks=4096 threads=128 avg_ms=0.007 bw=630.15 GB/s
+naive blocks=8192 threads=128 avg_ms=0.010 bw=418.81 GB/s
+naive blocks=1024 threads=256 avg_ms=0.004 bw=1034.34 GB/s
+naive blocks=2048 threads=256 avg_ms=0.005 bw=835.92 GB/s
+naive blocks=4096 threads=256 avg_ms=0.007 bw=616.87 GB/s
+naive blocks=8192 threads=256 avg_ms=0.010 bw=410.42 GB/s
+naive blocks=1024 threads=512 avg_ms=0.005 bw=849.79 GB/s
+naive blocks=2048 threads=512 avg_ms=0.007 bw=630.15 GB/s
+naive blocks=4096 threads=512 avg_ms=0.008 bw=515.87 GB/s
+naive blocks=8192 threads=512 avg_ms=0.012 bw=359.30 GB/s
+strided blocks=1024 threads=64 avg_ms=0.008 bw=533.33 GB/s
+strided blocks=2048 threads=64 avg_ms=0.007 bw=576.90 GB/s
+strided blocks=4096 threads=64 avg_ms=0.008 bw=555.01 GB/s
+strided blocks=8192 threads=64 avg_ms=0.011 bw=399.22 GB/s
+strided blocks=1024 threads=128 avg_ms=0.007 bw=604.13 GB/s
+strided blocks=2048 threads=128 avg_ms=0.007 bw=611.34 GB/s
+strided blocks=4096 threads=128 avg_ms=0.007 bw=585.14 GB/s
+strided blocks=8192 threads=128 avg_ms=0.010 bw=411.24 GB/s
+strided blocks=1024 threads=256 avg_ms=0.007 bw=605.92 GB/s
+strided blocks=2048 threads=256 avg_ms=0.007 bw=598.83 GB/s
+strided blocks=4096 threads=256 avg_ms=0.008 bw=512.00 GB/s
+strided blocks=8192 threads=256 avg_ms=0.011 bw=367.68 GB/s
+strided blocks=1024 threads=512 avg_ms=0.007 bw=591.91 GB/s
+strided blocks=2048 threads=512 avg_ms=0.008 bw=494.69 GB/s
+strided blocks=4096 threads=512 avg_ms=0.010 bw=422.27 GB/s
+strided blocks=8192 threads=512 avg_ms=0.013 bw=311.72 GB/s
+vectorized blocks=1024 threads=64 avg_ms=0.006 bw=646.06 GB/s
+vectorized blocks=2048 threads=64 avg_ms=0.006 bw=654.31 GB/s
+vectorized blocks=4096 threads=64 avg_ms=0.007 bw=600.59 GB/s
+vectorized blocks=8192 threads=64 avg_ms=0.010 bw=400.00 GB/s
+vectorized blocks=1024 threads=128 avg_ms=0.006 bw=689.56 GB/s
+vectorized blocks=2048 threads=128 avg_ms=0.006 bw=691.89 GB/s
+vectorized blocks=4096 threads=128 avg_ms=0.007 bw=573.67 GB/s
+vectorized blocks=8192 threads=128 avg_ms=0.011 bw=392.34 GB/s
+vectorized blocks=1024 threads=256 avg_ms=0.006 bw=675.91 GB/s
+vectorized blocks=2048 threads=256 avg_ms=0.006 bw=669.28 GB/s
+vectorized blocks=4096 threads=256 avg_ms=0.008 bw=553.51 GB/s
+vectorized blocks=8192 threads=256 avg_ms=0.011 bw=377.16 GB/s
+vectorized blocks=1024 threads=512 avg_ms=0.006 bw=680.40 GB/s
+vectorized blocks=2048 threads=512 avg_ms=0.007 bw=615.02 GB/s
+vectorized blocks=4096 threads=512 avg_ms=0.009 bw=477.39 GB/s
+vectorized blocks=8192 threads=512 avg_ms=0.013 bw=333.55 GB/s
+Copy output data from the CUDA device to the host memory
+Timing (ms): H2D=2.118 (1.98 GB/s), Kernel=(sweep), D2H=2.694 (1.56 GB/s)
+Device memory after alloc:  free=39886 MB, total=40326 MB (delta=-12 MB)
+Device memory after free:  free=39898 MB, total=40326 MB (recovered=+12 MB)
+Overall wall time: 468.257 ms, Peak RSS: 158 MB
