@@ -10,43 +10,27 @@
 #include <cuda_runtime.h>
 #include <assert.h>
 
-template <bool kCausal, bool kSliding>
-struct MaskPolicy
-{
-    int win_left; // only used if kSliding
-    int win_right;
-    int seq_len_q;
-    int seq_len_k;
-
-    __device__ __forceinline__ bool operator()(int q, int k) const
-    {
-        if (q >= seq_len_q || k >= seq_len_k)
-            return true;
-        bool m = false;
-        if constexpr (kCausal)
-        {
-            m |= (k > q);
-        }
-        if constexpr (kSliding)
-        {
-            if (win_left >= 0)
-                m |= (k < q - win_left);
-            if (win_right >= 0)
-                m |= (k > q + win_right);
-        }
-        return m;
-    }
-    __device__ __forceinline__ float addend(int q, int k) const
-    {
-        return (*this)(q, k) ? -INFINITY : 0.f;
-    }
-};
-
-__global__ void flash_attn_fwd(int B, int H, int D, const float *Q, const float *K, const float *V, float *O, float scaling_factor, const bool *mask, float dropout_prob, const int M, int BC, int BR, float *l, float *m)
+__global__ void flash_attn_fwd(
+    int B,
+    int H,
+    int N,
+    int D,
+    const float *Q,
+    const float *K,
+    const float *V,
+    float *O,
+    float scaling_factor,
+    const bool *mask,
+    float dropout_prob,
+    const int M,
+    int BC,
+    int BR,
+    float *l,
+    float *m)
 {
 
-    int tc = (n + bc - 1) / bc;
-    int tr = (n + br - 1) / br;
+    int tc = (N + BC - 1) / BC;
+    int tr = (N + BR - 1) / BR;
 
     __shared__ float Qi[BR * D];
     __shared__ float Ki[BC * D];
@@ -57,58 +41,55 @@ __global__ void flash_attn_fwd(int B, int H, int D, const float *Q, const float 
     __shared__ float Oi[BR * D];
     __shared__ float Pi[BR * BC];
 
-    const int batch_offset = gridDim.x * blockIdx.x * H * D;
+    const int batch_offset = blockIdx.z * N * D;
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    const int num_warps = blockDim.x >> 5;
 
     for (int i = 0; i < tr; i++)
     {
-        // load the Qi to shared memory
-        for (int j = 0; j * blockDim.x + threadIdx.x < (BR * D); j++)
+        for (int idx = threadIdx.x; idx < BR * D; idx += blockDim.x)
         {
-            int index = j * blockDim.x + threadIdx.x;
-            if (index < BR * D)
-            {
-                int row = index / D;
-                int col = index - row * D; // equivalent to index % D but slightly cheaper
-                Qi[row * D + col] = Q[batch_offset + index + i * BR * D];
-                Mip[row] = -CUDART_INF_F;
-                Lip[row] = 0.0f;
-                Oi[row * D + col] = 0.0f;
-            }
+            Qi[idx] = Q[batch_offset + i * BR * D + idx];
+            Oi[idx] = 0.0f;
+        }
+
+        for (int r = threadIdx.x; r < BR; r += blockDim.x)
+        {
+            Mi[r] = -CUDART_INF_F;
+            Li[r] = 0.0f;
         }
 
         __syncthreads();
 
         for (int j = 0; j < tc; j++)
         {
-            // load the Ki and Vi to shared memory
-            for (int k = 0; k * blockDim.x + threadIdx.x < (BC * D); k++)
             {
-                int index = k * blockDim.x + threadIdx.x;
-                if (index < BC * D)
+                const int base = batch_offset + j * BC * D;
+                for (int idx = threadIdx.x; idx < BC * D; idx += blockDim.x)
                 {
-                    int row = index / D;
-                    int col = index - row * D; // equivalent to index % D but slightly cheaper
-                    Ki[row * D + col] = K[batch_offset + index + j * BC * D];
-                    Vi[row * D + col] = V[batch_offset + index + j * BC * D];
+                    Ki[idx] = K[base + idx];
+                    Vi[idx] = V[base + idx];
                 }
             }
 
             __syncthreads();
 
-            // compute matrix multiplication of S
-            for (int k = 0; (threadIdx.x + k * blockDim.x) < (BR * BC); k++)
+            // Compute S using a warp-per-row mapping to avoid div/mod per element
+            for (int row = warp_id; row < BR; row += num_warps)
             {
-                int index = threadIdx.x + k * blockDim.x;
-                if (index < BR * BC)
+                for (int base = 0; base < BC; base += 32)
                 {
-                    int row = index / BC;
-                    int col = index - row * BC; // equivalent to index % BC but slightly cheaper
-                    float sum = 0.0;
-                    for (int e = 0; e < D; e++)
+                    int col = base + lane;
+                    if (col < BC)
                     {
-                        sum += Qi[row * D + e] * Ki[col * D + e];
+                        float sum = 0.0f;
+                        for (int e = 0; e < D; ++e)
+                        {
+                            sum += Qi[row * D + e] * Ki[col * D + e];
+                        }
+                        S[row * BC + col] = sum * scaling_factor;
                     }
-                    S[row * BC + col] = sum * scaling_factor;
                 }
             }
 
@@ -120,9 +101,7 @@ __global__ void flash_attn_fwd(int B, int H, int D, const float *Q, const float 
             //  - blockDim.x is a multiple of 32.
             //  - BR can be >= num_warps; we iterate rows in a strided fashion per warp.
             //  - S holds BR x BC scores (already computed). We compute Mi[row] = max over columns.
-            int lane = threadIdx.x & 31;
-            int warp_id = threadIdx.x >> 5;
-            int num_warps = blockDim.x >> 5;
+            // lane/warp_id/num_warps already computed above
 
             __shared__ float MiOld[BR];
 
@@ -136,8 +115,8 @@ __global__ void flash_attn_fwd(int B, int H, int D, const float *Q, const float 
                     float val = (col < BC) ? S[row * BC + col] : -CUDART_INF_F;
                     vmax = fmaxf(vmax, val);
                 }
-// In-warp reduce vmax.
-#pragma unroll
+                // In-warp reduce vmax.
+                #pragma unroll
                 for (int offset = 16; offset > 0; offset >>= 1)
                 {
                     float other = __shfl_down_sync(0xffffffff, vmax, offset);
@@ -159,11 +138,12 @@ __global__ void flash_attn_fwd(int B, int H, int D, const float *Q, const float 
                     int col = base + lane;
                     float val = (col < BC) ? S[row * BC + col] : -CUDART_INF_F;
                     float p = __expf(val - mval);
-                    Pi[row * BC + col] = p; // store the probability for later use
+                    if (col < BC)
+                        Pi[row * BC + col] = p; // store the probability for later use
                     lsum += p;
                 }
-// In-warp reduce lsum.
-#pragma unroll
+                // In-warp reduce lsum.
+                #pragma unroll
                 for (int offset = 16; offset > 0; offset >>= 1)
                 {
                     float other = __shfl_down_sync(0xffffffff, lsum, offset);
@@ -175,37 +155,48 @@ __global__ void flash_attn_fwd(int B, int H, int D, const float *Q, const float 
 
             __syncthreads();
 
-            // compute Oi = diag(exp(MOld - M)) @ Oi + Pi @ Vi
-            for (int k = 0; (threadIdx.x + k * blockDim.x) < (BR * D); k++)
+            // compute Oi = diag(exp(MOld - M)) @ Oi + Pi @ Vi (warp-per-row)
+            for (int row = warp_id; row < BR; row += num_warps)
             {
-                int index = threadIdx.x + k * blockDim.x;
-                int row = index / D;
-                int col = index - row * D; // equivalent to index % D but slightly cheaper
-
-                Oi[row * D + col] = Oi[row * D + col] * __expf(-MiOld[row] + Mi[row]);
-
-                for (int e = 0; e < BC; e++)
+                float scale = __expf(-MiOld[row] + Mi[row]);
+                for (int cbase = 0; cbase < D; cbase += 32)
                 {
-                    float p = Pi[row * BC + e];
-                    float v = Vi[e * D + col];
-                    Oi[row * D + col] += p * v;
+                    int col = cbase + lane;
+                    if (col < D)
+                    {
+                        float acc = Oi[row * D + col] * scale;
+                        for (int e = 0; e < BC; ++e)
+                        {
+                            float p = Pi[row * BC + e];
+                            float v = Vi[e * D + col];
+                            acc += p * v;
+                        }
+                        Oi[row * D + col] = acc;
+                    }
                 }
             }
 
             __syncthreads();
         }
 
-        // write the Oi to global memory
-        for (int j = 0; j * blockDim.x + threadIdx.x < (BR * D); j++)
+        // write the Oi to global memory (warp-per-row)
         {
-            int index = j * blockDim.x + threadIdx.x;
-            int row = index / D;
-            int col = index - row * D; // equivalent to index % D but slightly cheaper
-            O[batch_offset + index + i * BR * D] = Oi[row * D + col] / Li[row];
-
-            if (col == 0)
+            for (int row = warp_id; row < BR; row += num_warps)
             {
-                L[batch_offset / D + i * BR + row] = Li[row];
+                float Li_row = Li[row];
+                for (int cbase = 0; cbase < D; cbase += 32)
+                {
+                    int col = cbase + lane;
+                    if (col < D)
+                    {
+                        int out_index = batch_offset + i * BR * D + row * D + col;
+                        O[out_index] = Oi[row * D + col] / Li_row;
+                    }
+                }
+                if (lane == 0)
+                {
+                    l[batch_offset / D + i * BR + row] = Li_row;
+                }
             }
         }
     }
