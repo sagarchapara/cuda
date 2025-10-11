@@ -32,14 +32,16 @@ __global__ void flash_attn_fwd(
     int tc = (N + BC - 1) / BC;
     int tr = (N + BR - 1) / BR;
 
-    __shared__ float Qi[BR * D];
-    __shared__ float Ki[BC * D];
-    __shared__ float Vi[BC * D];
-    __shared__ float S[BR * BC];
-    __shared__ float Mi[BR];
-    __shared__ float Li[BR];
-    __shared__ float Oi[BR * D];
-    __shared__ float Pi[BR * BC];
+    extern __shared__ float smem[];
+    float *Qi = smem;                   // BR * D
+    float *Ki = Qi + (BR * D);          // BC * D
+    float *Vi = Ki + (BC * D);          // BC * D
+    float *S  = Vi + (BC * D);          // BR * BC
+    float *Mi = S  + (BR * BC);         // BR
+    float *Li = Mi + BR;                // BR
+    float *Oi = Li + BR;                // BR * D
+    float *Pi = Oi + (BR * D);          // BR * BC
+    float *MiOld = Pi + (BR * BC);      // BR
 
     const int batch_offset = blockIdx.z * N * D;
     const int lane = threadIdx.x & 31;
@@ -102,8 +104,6 @@ __global__ void flash_attn_fwd(
             //  - BR can be >= num_warps; we iterate rows in a strided fashion per warp.
             //  - S holds BR x BC scores (already computed). We compute Mi[row] = max over columns.
             // lane/warp_id/num_warps already computed above
-
-            __shared__ float MiOld[BR];
 
             for (int row = warp_id; row < BR; row += num_warps)
             {
