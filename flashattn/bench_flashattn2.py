@@ -7,7 +7,7 @@ from itertools import product
 import torch
 
 def benchmark_flashattn2(batch_list=(8,16,32), seqlen_list=(512,1024), heads=8, dim=64,
-                         dtype=torch.float16, device='cuda', iters=50, warmup=10,
+                         dtype=torch.bfloat16, device='cuda', iters=30, warmup=5,
                          out_csv='bench_flash2.csv'):
     # Try to import flash-attn v2 interface; else fall back to PyTorch SDPA (flash backend)
     use_fa2 = True
@@ -19,6 +19,16 @@ def benchmark_flashattn2(batch_list=(8,16,32), seqlen_list=(512,1024), heads=8, 
         use_fa2 = False
 
     results = []
+
+    # Allow overriding dtype/iters via env quickly
+    dtype_env = os.getenv('FA_DTYPE', '').lower()
+    if dtype_env in ('bf16','bfloat16'):
+        dtype = torch.bfloat16
+    elif dtype_env in ('fp16','float16','half'):
+        dtype = torch.float16
+
+    iters = int(os.getenv('FA_ITERS', iters))
+    warmup = int(os.getenv('FA_WARMUP', warmup))
 
     for B, N in product(batch_list, seqlen_list):
         # Allocate Q,K,V as [B, N, H, D], then reshape to [B*H, N, D] logically inside op
