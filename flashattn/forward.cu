@@ -78,189 +78,190 @@ __global__ void flash_attn_fwd(
     {
         Qi[idx] = Q[batch_offset + i * BR * D + idx];
     }
-
     __syncthreads();
 
     // We are giving 16 rows per warp
-    for (int j = 0; j < tc; ++j)
+
+    // Each warp computes 16 rows of O
+    for (int row_base = warp_id * WM; row_base < BR; row_base += num_warps * WM)
     {
-        // Flat cooperative copy of K/V tile [BC x D] into shared Ki/Vi
-        const int tile_elems = BC * D;
-        const int g_base = batch_offset + j * BC * D;
-        for (int idx = threadIdx.x; idx < tile_elems; idx += blockDim.x)
+
+        // First Pass, compute max of the row
+        float m_i[WM]; // max per row
+        float l_i[WM]; // sum per row
+
+#pragma unroll
+        for (int w = 0; w < WM; ++w)
         {
-            Ki[idx] = K[g_base + idx];
-            Vi[idx] = V[g_base + idx];
+            m_i[w] = -CUDART_INF_F;
+            l_i[w] = 0.0f;
         }
-        __syncthreads();
 
-        // Compute attention score
-        for (int row = warp_id * WM; row < BR; row += num_warps * WM)
+        for (int j = 0; j < tc; ++j)
         {
-            float Mi[WM] = {-CUDART_INF_F};
-            float Li[WM] = {0.0f};
-            if (lane == 0)
+            // Flat cooperative copy of K/V tile [BC x D] into shared Ki/Vi
+            const int tile_elems = BC * D;
+            const int g_base = batch_offset + j * BC * D;
+            for (int idx = threadIdx.x; idx < tile_elems; idx += blockDim.x)
             {
-#pragma unroll
-                for (int r = 0; r < WM; ++r)
-                {
-                    Mi[r] = -CUDART_INF_F;
-                    Li[r] = 0.0f;
-                }
+                Ki[idx] = K[g_base + idx];
+                Vi[idx] = V[g_base + idx];
             }
+            __syncthreads();
 
-            __syncwarp();
-
-            float vmax_rows[WM];
-
-#pragma unroll
-            for (int r = 0; r < WM; ++r)
-            {
-                vmax_rows[r] = -CUDART_INF_F;
-            }
-
-            // sweep columns in 16 wide tiles
             for (int col = 0; col < BC; col += WN)
             {
+
+                // Accumulator tile (WM x WN)
                 wmma::fragment<wmma::accumulator, WM, WN, WK, float> c_frag;
                 wmma::fill_fragment(c_frag, 0.0f);
 
-                // k dimension in 16 chuncks
-                for (int kdim = 0; kdim < D; kdim += WK)
+                for (int k = 0; k < D; k += WK)
                 {
-                    // A: 16*16 block from Q, row major
                     wmma::fragment<wmma::matrix_a, WM, WN, WK, wmma::precision::bfloat16, wmma::row_major> a_frag;
-
-                    const __nv_bfloat16 *Aptr = Qi + (row * D + kdim);
-                    wmma::load_matrix_sync(a_frag, Aptr, D);
-
-                    // B: 16*16 block from K^T, we have K as [BC*D] row-major,
-                    // So load B as col_major starting at (col0, k0) with ldb=D
                     wmma::fragment<wmma::matrix_b, WM, WN, WK, wmma::precision::bfloat16, wmma::col_major> b_frag;
 
-                    const __nv_bfloat16 *Bptr = Ki + (col * D + kdim);
+                    const __nv_float16 *Aptr = &Qi[row_base * D + k];
+                    wmma::load_matrix_sync(a_frag, Aptr, D);
+
+                    const __nv__float16 *Bptr = &Ki[col * D + k];
                     wmma::load_matrix_sync(b_frag, Bptr, D);
 
-                    // Accumulate
                     wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
                 }
 
                 float *c_tile = warp_scratch_ptr(warp_scratch_base, warp_id);
                 wmma::store_matrix_sync(c_tile, c_frag, WN, wmma::mem_row_major);
-
                 __syncwarp();
 
+// Compute max per row
+#pragma unroll
+                float m_tile[WM];
                 if (lane == 0)
                 {
 #pragma unroll
                     for (int r = 0; r < WM; ++r)
                     {
-                        const float *rowp = c_tile + r * WN;
-
-                        float local_max = rowp[0];
+                        float row_max = -CUDART_INF_F;
 #pragma unroll
-                        for (int c = 1; c < WN; ++c)
+                        for (int c = 0; c < WN; ++c)
                         {
-                            local_max = fmaxf(local_max, rowp[c]);
+                            row_max = fmaxf(row_max, c_tile[r * WN + c] * scaling_factor);
                         }
-                        vmax_rows[r] = fmaxf(vmax_rows[r], local_max * scaling_factor);
+                        m_tile[r] = row_max;
                     }
                 }
 
-                __syncwarp();
-            }
-
-            if (lane == 0)
-            {
-                for (int r = 0; r < WM; r++)
-                {
-                    vmax_rows[r] = max(Mi[row + r], vmax_rows[r]);
-                }
-            }
-
-            __syncwarp();
-
-            for (int r = 0; r < WM; r++)
-            {
-                for (int dbase = lane; dbase < D; dbase += 32)
-                {
-                    Oi[(r + row) * D + dbase] *= __expf(vmax_rows[r] - Mi[row + r]);
-                }
-            }
-
-            // sweep columns in 16 wide tiles
-            // Keep per-lane partial row sums to merge into Li after the sweep
-            float rowsum_local[WM];
 #pragma unroll
-            for (int rr = 0; rr < WM; ++rr)
-                rowsum_local[rr] = 0.f;
-
-            for (int col = 0; col < BC; col += WN)
-            {
-                wmma::fragment<wmma::accumulator, WM, WN, WK, float> c_frag;
-                wmma::fill_fragment(c_frag, 0.0f);
-
-                // k dimension in 16 chuncks
-                for (int kdim = 0; kdim < D; kdim += WK)
+                for (int r = 0; r < WM; ++r)
                 {
-                    // A: 16*16 block from Q, row major
-                    wmma::fragment<wmma::matrix_a, WM, WN, WK, wmma::precision::bfloat16, wmma::row_major> a_frag;
-
-                    const __nv_bfloat16 *Aptr = Qi + (row * D + kdim);
-                    wmma::load_matrix_sync(a_frag, Aptr, D);
-
-                    // B: 16*16 block from K^T, we have K as [BC*D] row-major,
-                    // So load B as col_major starting at (col0, k0) with ldb=D
-                    wmma::fragment<wmma::matrix_b, WM, WN, WK, wmma::precision::bfloat16, wmma::col_major> b_frag;
-                    const __nv_bfloat16 *Bptr = Ki + (col * D + kdim);
-                    wmma::load_matrix_sync(b_frag, Bptr, D);
-
-                    // Accumulate
-                    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+                    m_tile[r] = __shfl_sync(0xffffffff, m_tile[r], 0);
                 }
 
-                float *c_tile = warp_scratch_ptr(warp_scratch_base, warp_id);
-                wmma::store_matrix_sync(c_tile, c_frag, WN, wmma::mem_row_major);
-
-                __syncwarp();
-
-// Accumulate softmax row sums across all column tiles in this pass
-// Use lane-strided iteration to keep work within the warp
 #pragma unroll
+                for (int r = 0; r < WM; ++r)
+                {
+                    float new_m = fmaxf(m_tile[r], m_i[r]);
+                    float alpha = __expf(m_i[r] - new_m);
+                    li[r] *= alpha;
+                    mi[r] = new_m;
+                }
+
+                // Compute l_i, row sum
+                float rowsum_local[WM];
+#pragma unroll
+                for (int r = 0; r < WM; ++r)
+                {
+                    rowsum_local[r] = 0.0f;
+                }
+
                 for (int t = lane; t < WM * WN; t += 32)
                 {
-                    int rloc = t / WN; // row within WM tile
-                    int cloc = t % WN; // col within WN tile
-
-                    float logit = c_tile[t] * scaling_factor;
-                    float p = __expf(logit - vmax_rows[rloc]);
-
-                    rowsum_local[rloc] += p;
-
-                    // Accumulate into output with conflict-free d-strided writes
-                    for (int d = lane; d < D; d += 32)
-                    {
-                        float v = __bfloat162float(Vi[(col + cloc) * D + d]);
-                        Oi[(row + rloc) * D + d] += p * v;
-                    }
+                    int r = t / WN;
+                    int c = t % WN;
+                    float p = __expf(c_tile[r * WN + c] * scaling_factor - m_i[r]);
+                    rowsum_local[r] += p;
                 }
 
                 __syncwarp();
-            }
-            // After processing all column tiles, compute Li update via warp reduction
+
 #pragma unroll
-            for (int rloc = 0; rloc < WM; ++rloc)
+                for (int r = 0; r < WM; ++r)
+                {
+                    float sum = row_sum_local[r];
+                    // warp reduce
+                    for (int offset = 16; offset > 0; offset /= 2)
+                    {
+                        sum += __shfl_down_sync(0xffffffff, sum, offset);
+                    }
+                    if (lane == 0)
+                    {
+                        l_i[r] += sum;
+                    }
+                }
+            }
+        }
+
+        for (int dbase = lane; dbase < D; dbase += 32)
+        {
+            float acc[WM];
+#pragma unroll
+            for (int w = 0; w < WM; ++w)
             {
-                float v = rowsum_local[rloc];
-                for (int off = 16; off > 0; off >>= 1)
+                acc[w] = 0.0f;
+            }
+
+            for (int j = 0; j < tc; j++)
+            {
+                // Flat cooperative copy of K/V tile [BC x D] into shared Ki/Vi
+                const int tile_elems = BC * D;
+                const int g_base = batch_offset + j * BC * D;
+                for (int idx = threadIdx.x; idx < tile_elems; idx += blockDim.x)
                 {
-                    v += __shfl_down_sync(0xffffffff, v, off);
+                    Ki[idx] = K[g_base + idx];
+                    Vi[idx] = V[g_base + idx];
                 }
-                if (lane == 0)
+
+                __syncthreads();
+
+                for (int col = 0; col < BC; col += WN)
                 {
-                    Li[row + rloc] = Li[row + rloc] * __expf(Mi[row + rloc] - vmax_rows[rloc]) + v;
-                    Mi[row + rloc] = vmax_rows[rloc];
+                    wmma::fragment<wmma::accumulator, WM, WN, WK, float> c_frag;
+                    wmma::fill_fragment(c_frag, 0.0f);
+
+                    for (int k = 0; k < D; k += WK)
+                    {
+                        wmma::fragment<wmma::matrix_a, WM, WN, WK, wmma::precision::bfloat16, wmma::row_major> a_frag;
+                        wmma::fragment<wmma::matrix_b, WM, WN, WK, wmma::precision::bfloat16, wmma::col_major> b_frag;
+
+                        const __nv_float16 *Aptr = &Qi[row_base * D + k];
+                        wmma::load_matrix_sync(a_frag, Aptr, D);
+
+                        const __nv_float16 *Bptr = &Ki[col * D + k];
+                        wmma::load_matrix_sync(b_frag, Bptr, D);
+
+                        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+                    }
+
+                    float *c_tile = warp_scratch_ptr(warp_scratch_base, warp_id);
+                    wmma::store_matrix_sync(c_tile, c_frag, WN, wmma::mem_row_major);
+                    __syncwarp();
+
+                    // Compute output for the rows
+                    for (int t = lane; t < WM * WN; t += 32)
+                    {
+                        int r = t / WN;
+                        int c = t % WN;
+                        float p = __expf(c_tile[r * WN + c] * scaling_factor - m_i[r]);
+                        acc[r] += p * __bfloat162float(Vi[(col + c) * D + dbase]);
+                    }
                 }
+            }
+
+#pragma unroll
+            for (int w = 0; w < WM; ++w)
+            {
+                O[(i + row_base + w) * D + dbase] = acc[w];
             }
         }
     }
